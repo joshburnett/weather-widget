@@ -292,26 +292,61 @@ async function buildWidget() {
     }
   }
 
-  // ── 7. Daily high/low circles on the forecast line ────────────────────
-  // Find the actual hour index with the max/min temperature for each day
+  // ── Pre-compute daily hi/lo hour indices ──────────────────────────────
+  // High for day N = peak temp from sunrise[N] → sunrise[N+1] (dawn-to-dawn)
+  // Low  for day N = trough between peakTime[N] and peakTime[N+1]
+  // Shared by §7 (graph circles) and §10 (axis labels).
+  const sunrises = (data.daily.sunrise || []).map(parseLocalTime);
+  const dayKeys  = data.daily.time;
+  const dayHiIdx = new Array(dayKeys.length).fill(-1); // index into htimes/htemp
+  const dayLoIdx = new Array(dayKeys.length).fill(-1);
+
+  // Pass 1: dawn-to-dawn high
+  for (let d = 0; d < dayKeys.length; d++) {
+    const dawnStart = sunrises[d];
+    if (!dawnStart) continue;
+    const dawnEnd = sunrises[d + 1] ?? new Date(+dawnStart + MS_DAY);
+    let best = -Infinity, idx = -1;
+    for (let i = 0; i < htimes.length; i++) {
+      if (htimes[i] >= dawnStart && htimes[i] < dawnEnd && htemp[i] != null && htemp[i] > best) {
+        best = htemp[i]; idx = i;
+      }
+    }
+    dayHiIdx[d] = idx;
+  }
+
+  // Pass 2: trough between consecutive highs → overnight low
+  for (let d = 0; d < dayKeys.length; d++) {
+    const hiIdx = dayHiIdx[d];
+    if (hiIdx < 0) continue;
+    const nextHiIdx = d + 1 < dayKeys.length ? dayHiIdx[d + 1] : -1;
+    const tStart = htimes[hiIdx];
+    const tEnd   = nextHiIdx >= 0 ? htimes[nextHiIdx]
+                 : sunrises[d + 1] ?? new Date(+sunrises[d] + MS_DAY);
+    let best = Infinity, idx = -1;
+    for (let i = 0; i < htimes.length; i++) {
+      if (htimes[i] >= tStart && htimes[i] <= tEnd && htemp[i] != null && htemp[i] < best) {
+        best = htemp[i]; idx = i;
+      }
+    }
+    dayLoIdx[d] = idx;
+  }
+
+  // ── 7. Daily high/low circles ─────────────────────────────────────────
+  // Drawn on both the gray (past) and red (forecast) portions of the line,
+  // so the actual peak/trough times are always marked even if already past.
   const CR = 7; // circle radius in canvas pixels
-  for (let d = 0; d < data.daily.time.length; d++) {
-    const ds  = parseLocalTime(data.daily.time[d] + "T00:00");
-    const de  = new Date(+ds + MS_DAY);
-    const fut = rangeIdx.filter(
-      (i) => htimes[i] >= ds && htimes[i] < de && htimes[i] >= now
-    );
-    if (fut.length === 0) continue;
-
-    const hiI = fut.reduce((b, i) => (htemp[i] > htemp[b] ? i : b));
-    const loI = fut.reduce((b, i) => (htemp[i] < htemp[b] ? i : b));
-
-    for (const idx of [hiI, ...(loI !== hiI ? [loI] : [])]) {
+  for (let d = 0; d < dayKeys.length; d++) {
+    const candidates = [...new Set([dayHiIdx[d], dayLoIdx[d]])];
+    for (const idx of candidates) {
+      if (idx < 0) continue;
+      if (htimes[idx] < graphStart || htimes[idx] >= graphEnd) continue;
       const cx = tx(htimes[idx]);
       const cy = ty(htemp[idx]);
       ctx.setFillColor(Color.white());
       ctx.fillEllipse(new Rect(cx - CR, cy - CR, CR * 2, CR * 2));
-      ctx.setStrokeColor(new Color("#cc3333"));
+      const pastMarker = htimes[idx] <= now;
+      ctx.setStrokeColor(pastMarker ? new Color("#888888") : new Color("#cc3333"));
       ctx.setLineWidth(2.5);
       ctx.strokeEllipse(new Rect(cx - CR, cy - CR, CR * 2, CR * 2));
     }
@@ -372,6 +407,14 @@ async function buildWidget() {
   }
 
   // ── 10. Day labels + hi/lo (centered within each day's section) ──────
+  // hi/lo values come from dayHiIdx / dayLoIdx pre-computed before §7.
+  const dawnHiLo = {};
+  for (let d = 0; d < dayKeys.length; d++) {
+    const hi = dayHiIdx[d] >= 0 ? htemp[dayHiIdx[d]] : null;
+    const lo = dayLoIdx[d] >= 0 ? htemp[dayLoIdx[d]] : null;
+    if (hi !== null) dawnHiLo[dayKeys[d]] = { hi, lo: lo ?? hi };
+  }
+
   // Build section x-boundary array
   const secX = [GX];
   for (let d = 1; d < GRAPH_DAYS; d++) secX.push(tx(+todayStart + d * MS_DAY));
@@ -382,13 +425,12 @@ async function buildWidget() {
     const sectionDate = new Date(+todayStart + d * MS_DAY);
     const label  = d === 0 ? "TODAY" : dayLabel(sectionDate);
 
-    // Look up this day in the daily API data for hi/lo
-    const dsKey    = dateStr(sectionDate);
-    const dailyIdx = data.daily.time.indexOf(dsKey);
+    // Look up dawn-to-dawn hi/lo for this day
+    const dsKey = dateStr(sectionDate);
     let hiLoText = "";
-    if (dailyIdx >= 0) {
-      const hi = Math.round(data.daily.temperature_2m_max[dailyIdx]);
-      const lo = Math.round(data.daily.temperature_2m_min[dailyIdx]);
+    if (dawnHiLo[dsKey]) {
+      const hi = Math.round(dawnHiLo[dsKey].hi);
+      const lo = Math.round(dawnHiLo[dsKey].lo);
       hiLoText = `${hi}° | ${lo}°`;
     }
 
@@ -407,10 +449,11 @@ async function buildWidget() {
     }
   }
 
-  // ── 11. Location name (upper-left, on top of graph) ───────────────────
+  // ── 11. Location name (upper-right, on top of graph) ──────────────────
   ctx.setFont(Font.systemFont(27));
   ctx.setTextColor(Color.black());
-  ctx.drawTextInRect(locationName, new Rect(GX + 14, GY + 6, 300, 34));
+  ctx.setTextAlignedRight();
+  ctx.drawTextInRect(locationName, new Rect(GX + GW - 314, GY + 6, 300, 34));
 
   // ── Assemble widget ────────────────────────────────────────────────────
   const widget = new ListWidget();
